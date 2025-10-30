@@ -8,13 +8,17 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/reflow/wrap"
 )
 
 const MAX = 20
+
+var page = 0
 
 var (
 	titleBarStyle = lipgloss.NewStyle().
@@ -59,6 +63,7 @@ type Story struct {
 }
 
 type loadedStoriesMsg struct{ loadedStories [MAX]Story }
+type loadedCommentsMsg struct{ loadedComments Story }
 type errMsg struct{ err error }
 
 func fetchTopStories() tea.Msg {
@@ -73,36 +78,53 @@ func fetchTopStories() tea.Msg {
 		return errMsg{err}
 	}
 
-	var storyID []int
-	if err := json.Unmarshal(body, &storyID); err != nil {
+	var storiesID []int
+	if err := json.Unmarshal(body, &storiesID); err != nil {
 		return errMsg{err}
 	}
 
 	var stories [MAX]Story
-	for i := range MAX {
-		story, err := http.Get(fmt.Sprintf("https://hacker-news.firebaseio.com/v0/item/%d.json?print=pretty", storyID[i]))
+
+	start := max(0, page*MAX)
+	end := start + MAX
+
+	if start >= len(storiesID) {
+		page = len(storiesID)/MAX - 1
+		start = page * MAX
+		end = start + MAX
+	}
+	if end > len(storiesID) {
+		end = len(storiesID)
+	}
+
+	for i, id := range storiesID[start:end] {
+		storyResp, err := http.Get(fmt.Sprintf("https://hacker-news.firebaseio.com/v0/item/%d.json?print=pretty", id))
 		if err != nil {
 			continue
 		}
-		storyBody, err := io.ReadAll(story.Body)
-		story.Body.Close()
+		storyBody, err := io.ReadAll(storyResp.Body)
+		storyResp.Body.Close()
 		if err != nil {
 			continue
 		}
-		if err := json.Unmarshal(storyBody, &stories[i]); err != nil {
+
+		var s Story
+		if err := json.Unmarshal(storyBody, &s); err != nil {
 			continue
 		}
+		stories[i] = s
 	}
 	return loadedStoriesMsg{loadedStories: stories}
 }
 
 type model struct {
-	stories [MAX]Story
-	cursor  int
-	loading bool
-	err     error
-	width   int
-	height  int
+	stories      [MAX]Story
+	cursor       int
+	loading      bool
+	commentsView bool
+	err          error
+	width        int
+	height       int
 }
 
 func initialModel() model {
@@ -147,6 +169,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.loading = true
 			return m, fetchTopStories
+		case "c":
+			m.commentsView = !m.commentsView
+		case "pgup", "l":
+			page++
+			m.loading = true
+			return m, fetchTopStories
+		case "pgdown", "h":
+			page--
+			m.loading = true
+			return m, fetchTopStories
 		case "enter":
 			openURL(m.stories[m.cursor].URL)
 		}
@@ -155,16 +187,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	if m.loading {
-		return "\n  Loading Hacker News stories...\n"
-	}
+	var s strings.Builder
 
 	if m.err != nil {
 		return fmt.Sprintf("\n  Error: %v\n\n  Press 'r' to retry or 'q' to quit.\n", m.err)
 	}
 
-	var s strings.Builder
-	s.WriteString(titleBarStyle.Width(m.width).Render("Hacker News "))
+	if m.commentsView {
+		return strconv.Itoa(m.stories[m.cursor].Kids[0])
+	}
+
+	s.WriteString(titleBarStyle.Width(m.width).Render("Hacker News"))
+
+	if m.loading {
+		s.WriteString("\nLoading...\n")
+	}
 
 	visibleStart := 0
 	visibleEnd := len(m.stories)
@@ -208,13 +245,12 @@ func (m model) View() string {
 
 	}
 
-	s.WriteString("\nj/k: move | r: refresh | q: quit | enter: open URL in browser")
+	s.WriteString(wrap.String("\nj/k: move | r: refresh | enter: view in browser | h/l: move beetween pages | c: comments | q: quit", m.width))
 
 	return s.String()
 }
 
 // https://stackoverflow.com/questions/39320371/how-start-web-server-to-open-page-in-browser-in-golang
-// openURL opens the specified URL in the default browser of the user.
 func openURL(url string) error {
 	var cmd string
 	var args []string
@@ -226,32 +262,14 @@ func openURL(url string) error {
 	case "darwin":
 		cmd = "open"
 		args = []string{url}
-	default: // "linux", "freebsd", "openbsd", "netbsd"
-		// Check if running under WSL
-		if isWSL() {
-			// Use 'cmd.exe /c start' to open the URL in the default Windows browser
-			cmd = "cmd.exe"
-			args = []string{"/c", "start", url}
-		} else {
-			// Use xdg-open on native Linux environments
-			cmd = "xdg-open"
-			args = []string{url}
-		}
+	default:
+		cmd = "xdg-open"
+		args = []string{url}
 	}
 	if len(args) > 1 {
-		// args[0] is used for 'start' command argument, to prevent issues with URLs starting with a quote
 		args = append(args[:1], append([]string{""}, args[1:]...)...)
 	}
 	return exec.Command(cmd, args...).Start()
-}
-
-// isWSL checks if the Go program is running inside Windows Subsystem for Linux
-func isWSL() bool {
-	releaseData, err := exec.Command("uname", "-r").Output()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(string(releaseData)), "microsoft")
 }
 
 func main() {
